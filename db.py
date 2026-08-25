@@ -27,14 +27,18 @@ def init_explorer_db(path: str = EXPLORER_DB) -> None:
 
 
 def get_lastfm_conn(readonly: bool = True) -> sqlite3.Connection:
-    uri = f"file:{LASTFM_DB}?mode=ro" if readonly else LASTFM_DB
+    # immutable=1 (no solo mode=ro): lastfm_data se monta :ro en Docker, y
+    # sin este flag SQLite falla al primer acceso real con "unable to open
+    # database file" — mode=ro no basta en un bind-mount de solo lectura,
+    # necesita que se le diga explícitamente que no intente bloqueos/journal.
+    uri = f"file:{LASTFM_DB}?mode=ro&immutable=1" if readonly else LASTFM_DB
     conn = sqlite3.connect(uri, uri=readonly)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def get_musica_local_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{MUSICA_LOCAL_DB}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{MUSICA_LOCAL_DB}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -51,7 +55,10 @@ def get_search_conn() -> sqlite3.Connection:
     """Conexión de solo lectura sobre lastfm_stats.db con explorer.db adjunta
     como esquema 'enrich' para poder hacer JOIN entre ambas bases."""
     init_explorer_db()
-    conn = sqlite3.connect(f"file:{LASTFM_DB}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{LASTFM_DB}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
-    conn.execute("ATTACH DATABASE ? AS enrich", (f"file:{EXPLORER_DB}?mode=ro",))
+    # explorer.db sí es escribible (lo actualiza enrich_albums.py aparte),
+    # así que aquí no lleva immutable=1 -- solo mode=ro para no escribirlo
+    # desde las peticiones de búsqueda.
+    conn.execute(f"ATTACH DATABASE 'file:{EXPLORER_DB}?mode=ro' AS enrich")
     return conn
