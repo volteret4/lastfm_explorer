@@ -73,12 +73,24 @@ LEFT JOIN albums al ON al.album_id = s.album_id
 LEFT JOIN enrich.album_enrichment e ON e.lastfm_album_id = al.album_id
 """
 
+SORT_COLUMNS = {
+    "listened": "s.ts",
+    "artist": "a.name COLLATE NOCASE",
+    "album": "al.name COLLATE NOCASE",
+    "track": "s.track COLLATE NOCASE",
+    "label": "e.label COLLATE NOCASE",
+    "release_date": "e.release_date",
+    "source": "s.source COLLATE NOCASE",
+}
+
 
 @app.route("/api/search")
 def api_search():
     page = max(1, _int_or(request.args.get("page"), 1))
     per_page = min(200, max(1, _int_or(request.args.get("per_page"), PER_PAGE)))
     where_sql, params = build_search(request.args)
+    sort_col = SORT_COLUMNS.get(request.args.get("sort"), SORT_COLUMNS["listened"])
+    sort_dir = "ASC" if request.args.get("dir") == "asc" else "DESC"
 
     conn = get_search_conn()
     total = conn.execute(f"SELECT COUNT(*) {BASE_QUERY} {where_sql}", params).fetchone()[0]
@@ -92,7 +104,7 @@ def api_search():
                 WHERE ag.artist_id = a.artist_id) AS artist_genres
         {BASE_QUERY}
         {where_sql}
-        ORDER BY s.ts DESC
+        ORDER BY {sort_col} {sort_dir}, s.ts DESC
         LIMIT ? OFFSET ?
         """,
         [*params, per_page, (page - 1) * per_page],
@@ -284,8 +296,14 @@ button.secondary { background: var(--surface-2); color: var(--text); }
 table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 10px; overflow: hidden; }
 th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
 th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
+th .sort-arrow { color: var(--accent); margin-left: 3px; }
 tr:hover td { background: var(--surface-2); }
 .badge { display: inline-block; background: var(--surface-2); color: var(--text-muted); padding: 1px 6px; border-radius: 4px; font-size: 11px; margin-right: 3px; }
+.clickable { cursor: pointer; }
+.clickable:hover { color: #fff; text-decoration: underline; }
+.badge.clickable:hover { background: var(--accent); color: var(--bg); text-decoration: none; }
 .pagination { display: flex; gap: 6px; justify-content: center; margin-top: 14px; }
 .pagination button { background: var(--surface-2); color: var(--text); padding: 6px 10px; }
 .pagination button.active { background: var(--accent); color: var(--bg); }
@@ -354,7 +372,16 @@ tr:hover td { background: var(--surface-2); }
 </div>
 <div id="chart-tooltip"></div>
 <table>
-    <thead><tr><th>Escuchado</th><th>Artista</th><th>Disco</th><th>Canción</th><th>Sello</th><th>Lanzamiento</th><th>Género</th><th>Fuente</th></tr></thead>
+    <thead><tr>
+        <th class="sortable" data-sort="listened">Escuchado<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="artist">Artista<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="album">Disco<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="track">Canción<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="label">Sello<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="release_date">Lanzamiento<span class="sort-arrow"></span></th>
+        <th>Género</th>
+        <th class="sortable" data-sort="source">Fuente<span class="sort-arrow"></span></th>
+    </tr></thead>
     <tbody id="results"></tbody>
 </table>
 <div class="pagination" id="pagination"></div>
@@ -390,28 +417,72 @@ function clearFilters() {
     search(1);
 }
 
+function soloFiltro(field, value) {
+    if (!value) return;
+    document.querySelectorAll('.filters input').forEach(i => i.value = '');
+    document.getElementById('f_' + field).value = value;
+    search(1);
+}
+
+let sortKey = 'listened', sortDir = 'desc', lastItems = [];
+
+function renderSortIndicators() {
+    document.querySelectorAll('th.sortable').forEach(th => {
+        const arrow = th.querySelector('.sort-arrow');
+        arrow.textContent = th.dataset.sort === sortKey ? (sortDir === 'asc' ? '▲' : '▼') : '';
+    });
+}
+
+document.querySelectorAll('th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+        const key = th.dataset.sort;
+        if (sortKey === key) {
+            sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+            sortKey = key;
+            sortDir = key === 'listened' ? 'desc' : 'asc';
+        }
+        search(1);
+    });
+});
+
 async function search(page) {
     currentPage = page;
     const params = currentFilters();
     params.set('page', page);
+    params.set('sort', sortKey);
+    params.set('dir', sortDir);
     const r = await fetch('/api/search?' + params.toString());
     const data = await r.json();
     totalPages = Math.max(1, Math.ceil(data.total / data.per_page));
+    lastItems = data.items;
 
     document.getElementById('summary').textContent = `${data.total} escuchas encontradas`;
     document.getElementById('results').innerHTML = data.items.map(it => `
         <tr>
             <td>${new Date(it.listened_at).toLocaleString('es-ES')}</td>
-            <td>${escapeHtml(it.artist)}</td>
-            <td>${escapeHtml(it.album || '')}</td>
-            <td>${escapeHtml(it.track)}</td>
-            <td>${escapeHtml(it.label || '')}</td>
+            <td class="clickable" data-field="artist">${escapeHtml(it.artist)}</td>
+            <td class="clickable" data-field="album">${escapeHtml(it.album || '')}</td>
+            <td class="clickable" data-field="track">${escapeHtml(it.track)}</td>
+            <td class="clickable" data-field="label">${escapeHtml(it.label || '')}</td>
             <td>${escapeHtml(it.release_date || '')}</td>
-            <td>${it.genres.map(g => `<span class="badge">${escapeHtml(g)}</span>`).join('')}</td>
+            <td>${it.genres.map((g, gi) => `<span class="badge clickable" data-field="genre" data-gidx="${gi}">${escapeHtml(g)}</span>`).join('')}</td>
             <td>${escapeHtml(it.source)}</td>
         </tr>
     `).join('');
 
+    document.querySelectorAll('#results tr').forEach((tr, i) => {
+        const item = lastItems[i];
+        tr.querySelectorAll('[data-field]').forEach(el => {
+            el.addEventListener('click', () => {
+                const field = el.dataset.field;
+                const value = field === 'genre' ? item.genres[parseInt(el.dataset.gidx)] : item[field];
+                soloFiltro(field, value);
+            });
+        });
+    });
+
+    renderSortIndicators();
     renderPagination();
     loadCharts();
 }
