@@ -86,7 +86,10 @@ def api_search():
         f"""
         SELECT s.scrobble_id, s.track, s.ts, s.ts_iso, s.source,
                a.name AS artist, al.name AS album,
-               e.release_date, e.label, e.genres_json
+               e.release_date, e.label, e.genres_json,
+               (SELECT GROUP_CONCAT(g.name, '||') FROM artist_genres ag
+                JOIN genres g ON g.genre_id = ag.genre_id
+                WHERE ag.artist_id = a.artist_id) AS artist_genres
         {BASE_QUERY}
         {where_sql}
         ORDER BY s.ts DESC
@@ -104,6 +107,10 @@ def api_search():
                 genres = json.loads(r["genres_json"])
             except (json.JSONDecodeError, TypeError):
                 pass
+        if r["artist_genres"]:
+            for g in r["artist_genres"].split("||"):
+                if g not in genres:
+                    genres.append(g)
         items.append({
             "artist": r["artist"], "album": r["album"], "track": r["track"],
             "listened_at": r["ts_iso"], "source": r["source"],
