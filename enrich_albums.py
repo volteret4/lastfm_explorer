@@ -98,15 +98,25 @@ def _mb_enrich(artist: str, album: str) -> dict:
 
 
 def _load_local_library(conn) -> dict:
-    """artist_norm|album_norm -> {label, release_date, genre}"""
+    """artist_norm|album_norm -> {label, release_date, genre}
+
+    musica_local.sqlite es opcional: si no está desplegado (o está vacío,
+    p.ej. tras el touch de scripts/up.sh en una máquina sin
+    sellos-discograficos), no tiene la tabla albums todavía -- se cae
+    directo al fallback de MusicBrainz para todo en vez de reventar.
+    """
     index = {}
-    rows = conn.execute(
-        """
-        SELECT ar.name AS artist, al.name AS album, al.label, al.year, al.genre
-        FROM albums al
-        JOIN artists ar ON ar.id = al.artist_id
-        """
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT ar.name AS artist, al.name AS album, al.label, al.year, al.genre
+            FROM albums al
+            JOIN artists ar ON ar.id = al.artist_id
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        print("musica_local.sqlite sin tabla 'albums' (vacía o no desplegada) -- solo fallback MusicBrainz")
+        return index
     for r in rows:
         key = f"{normalize(r['artist'])}|{normalize(r['album'])}"
         index[key] = {"label": r["label"], "release_date": r["year"], "genre": r["genre"]}
