@@ -120,6 +120,91 @@ def api_search():
     return jsonify({"total": total, "page": page, "per_page": per_page, "items": items})
 
 
+from collections import Counter
+
+TOP_LIMIT = 12
+
+
+@app.route("/api/stats/breakdown")
+def api_stats_breakdown():
+    dimension = request.args.get("dimension", "timeline")
+    where_sql, params = build_search(request.args)
+    conn = get_search_conn()
+
+    if dimension == "timeline":
+        rows = conn.execute(
+            f"""
+            SELECT strftime('%Y-%m', datetime(s.ts, 'unixepoch')) AS period, COUNT(*) AS c
+            {BASE_QUERY}
+            {where_sql}
+            GROUP BY period
+            ORDER BY period ASC
+            """,
+            params,
+        ).fetchall()
+        data = [{"label": r["period"], "count": r["c"]} for r in rows]
+
+    elif dimension == "artist":
+        rows = conn.execute(
+            f"""
+            SELECT a.name AS label, COUNT(*) AS c
+            {BASE_QUERY}
+            {where_sql}
+            GROUP BY a.artist_id
+            ORDER BY c DESC
+            LIMIT {TOP_LIMIT}
+            """,
+            params,
+        ).fetchall()
+        data = [{"label": r["label"], "count": r["c"]} for r in rows]
+
+    elif dimension == "label":
+        rows = conn.execute(
+            f"""
+            SELECT e.label AS label, COUNT(*) AS c
+            {BASE_QUERY}
+            {where_sql}{' AND' if where_sql else 'WHERE'} e.label IS NOT NULL AND e.label != ''
+            GROUP BY e.label
+            ORDER BY c DESC
+            LIMIT {TOP_LIMIT}
+            """,
+            params,
+        ).fetchall()
+        data = [{"label": r["label"], "count": r["c"]} for r in rows]
+
+    elif dimension == "genre":
+        rows = conn.execute(
+            f"""
+            SELECT e.genres_json,
+                   (SELECT GROUP_CONCAT(g.name, '||') FROM artist_genres ag
+                    JOIN genres g ON g.genre_id = ag.genre_id
+                    WHERE ag.artist_id = a.artist_id) AS artist_genres
+            {BASE_QUERY}
+            {where_sql}
+            """,
+            params,
+        ).fetchall()
+        counter = Counter()
+        for r in rows:
+            genres = set()
+            if r["genres_json"]:
+                try:
+                    genres.update(json.loads(r["genres_json"]))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if r["artist_genres"]:
+                genres.update(r["artist_genres"].split("||"))
+            counter.update(genres)
+        data = [{"label": g, "count": c} for g, c in counter.most_common(TOP_LIMIT)]
+
+    else:
+        conn.close()
+        return jsonify({"error": "dimensión desconocida"}), 400
+
+    conn.close()
+    return jsonify({"dimension": dimension, "data": data})
+
+
 @app.route("/api/filters/meta")
 def api_filters_meta():
     conn = get_search_conn()
@@ -205,6 +290,26 @@ tr:hover td { background: var(--surface-2); }
 .pagination button { background: var(--surface-2); color: var(--text); padding: 6px 10px; }
 .pagination button.active { background: var(--accent); color: var(--bg); }
 .pagination button:disabled { opacity: 0.4; cursor: default; }
+
+.charts { display: flex; flex-direction: column; gap: 14px; margin-bottom: 16px; }
+.charts-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.chart-card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); font-weight: 600; margin-bottom: 10px; }
+.chart-card svg { display: block; width: 100%; overflow: visible; }
+.chart-empty { color: var(--text-muted); font-size: 12px; padding: 20px 0; text-align: center; }
+.chart-bar { fill: var(--accent); cursor: pointer; transition: opacity 0.15s; }
+.chart-bar:hover, .chart-bar.hovered { opacity: 0.75; }
+.chart-axis-line { stroke: var(--border); stroke-width: 1; }
+.chart-tick { fill: var(--text-muted); font-size: 10px; }
+.chart-label { fill: var(--text-muted); font-size: 11px; }
+.chart-value { fill: var(--text); font-size: 11px; font-weight: 600; }
+#chart-tooltip {
+    position: fixed; pointer-events: none; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; color: var(--text); box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+    display: none; z-index: 100; white-space: nowrap;
+}
+#chart-tooltip .tt-value { color: #fff; font-weight: 700; }
+#chart-tooltip .tt-label { color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -227,6 +332,27 @@ tr:hover td { background: var(--surface-2); }
     </div>
 </div>
 <div id="summary"></div>
+<div class="charts">
+    <div class="chart-card">
+        <h3>Escuchas en el tiempo</h3>
+        <div id="chart-timeline"></div>
+    </div>
+    <div class="charts-row">
+        <div class="chart-card">
+            <h3>Top artistas</h3>
+            <div id="chart-artist"></div>
+        </div>
+        <div class="chart-card">
+            <h3>Top géneros</h3>
+            <div id="chart-genre"></div>
+        </div>
+        <div class="chart-card">
+            <h3>Top sellos</h3>
+            <div id="chart-label"></div>
+        </div>
+    </div>
+</div>
+<div id="chart-tooltip"></div>
 <table>
     <thead><tr><th>Escuchado</th><th>Artista</th><th>Disco</th><th>Canción</th><th>Sello</th><th>Lanzamiento</th><th>Género</th><th>Fuente</th></tr></thead>
     <tbody id="results"></tbody>
@@ -287,6 +413,161 @@ async function search(page) {
     `).join('');
 
     renderPagination();
+    loadCharts();
+}
+
+// ── Gráficos ────────────────────────────────────────────────────────────────
+
+const tooltipEl = document.getElementById('chart-tooltip');
+
+function showTooltip(evt, label, value) {
+    tooltipEl.innerHTML = '';
+    const valSpan = document.createElement('span');
+    valSpan.className = 'tt-value';
+    valSpan.textContent = value;
+    const labSpan = document.createElement('span');
+    labSpan.className = 'tt-label';
+    labSpan.textContent = '  ' + label;
+    tooltipEl.appendChild(valSpan);
+    tooltipEl.appendChild(labSpan);
+    tooltipEl.style.display = 'block';
+    tooltipEl.style.left = (evt.clientX + 14) + 'px';
+    tooltipEl.style.top = (evt.clientY + 14) + 'px';
+}
+
+function hideTooltip() {
+    tooltipEl.style.display = 'none';
+}
+
+function niceMax(n) {
+    if (n <= 0) return 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(n)));
+    const steps = [1, 2, 2.5, 5, 10];
+    for (const s of steps) {
+        if (n <= s * mag) return s * mag;
+    }
+    return 10 * mag;
+}
+
+// Rectángulo con el extremo del dato redondeado y la base cuadrada — nunca al revés.
+function barShape(x, y, w, h, dir) {
+    const r = 4;
+    if (dir === 'right') {
+        w = Math.max(w, 1);
+        const patch = Math.min(r, w);
+        return `<rect class="chart-bar" x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" ry="${r}"></rect>` +
+               `<rect x="${x}" y="${y}" width="${patch}" height="${h}" fill="var(--accent)" pointer-events="none"></rect>`;
+    }
+    h = Math.max(h, 1);
+    const patch = Math.min(r, h);
+    return `<rect class="chart-bar" x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" ry="${r}"></rect>` +
+           `<rect x="${x}" y="${y + h - patch}" width="${w}" height="${patch}" fill="var(--accent)" pointer-events="none"></rect>`;
+}
+
+function truncate(s, n) {
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+function renderTopBars(containerId, dimension, data, filterId) {
+    const el = document.getElementById(containerId);
+    if (!data.length) { el.innerHTML = '<div class="chart-empty">Sin datos todavía</div>'; return; }
+
+    const rowH = 26, barH = 14, labelW = 96, valueW = 46, width = 600;
+    const plotW = width - labelW - valueW;
+    const height = data.length * rowH;
+    const max = data[0].count;
+
+    let svg = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Gráfico de ${dimension}">`;
+    svg += `<line class="chart-axis-line" x1="${labelW}" y1="0" x2="${labelW}" y2="${height}"></line>`;
+    data.forEach((d, i) => {
+        const y = i * rowH + (rowH - barH) / 2;
+        const w = (d.count / max) * plotW;
+        svg += `<text class="chart-label" x="${labelW - 8}" y="${i * rowH + rowH / 2 + 4}" text-anchor="end">${escapeHtml(truncate(d.label, 16))}<title>${escapeHtml(d.label)}</title></text>`;
+        svg += `<g data-idx="${i}">`;
+        svg += barShape(labelW, y, w, barH, 'right');
+        svg += `<text class="chart-value" x="${labelW + w + 6}" y="${i * rowH + rowH / 2 + 4}">${d.count.toLocaleString('es-ES')}</text>`;
+        svg += `</g>`;
+    });
+    svg += `</svg>`;
+    el.innerHTML = svg;
+
+    el.querySelectorAll('g[data-idx]').forEach(g => {
+        const d = data[parseInt(g.dataset.idx)];
+        g.addEventListener('pointermove', evt => showTooltip(evt, d.label, d.count.toLocaleString('es-ES')));
+        g.addEventListener('pointerleave', hideTooltip);
+        g.addEventListener('click', () => {
+            document.getElementById('f_' + filterId).value = d.label;
+            search(1);
+        });
+        g.style.cursor = 'pointer';
+    });
+}
+
+function renderTimeline(containerId, data) {
+    const el = document.getElementById(containerId);
+    if (!data.length) { el.innerHTML = '<div class="chart-empty">Sin datos todavía</div>'; return; }
+
+    const width = 900, height = 160, padL = 34, padB = 20, padT = 6;
+    const plotW = width - padL - 10, plotH = height - padB - padT;
+    const max = niceMax(Math.max(...data.map(d => d.count)));
+    const barGap = 2;
+    const barW = Math.max((plotW / data.length) - barGap, 1);
+
+    let svg = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Escuchas por mes">`;
+    [0, 0.5, 1].forEach(f => {
+        const y = padT + plotH * (1 - f);
+        svg += `<line class="chart-axis-line" x1="${padL}" y1="${y}" x2="${width - 10}" y2="${y}"></line>`;
+        svg += `<text class="chart-tick" x="${padL - 6}" y="${y + 3}" text-anchor="end">${Math.round(max * f).toLocaleString('es-ES')}</text>`;
+    });
+
+    const labelStep = Math.max(1, Math.ceil(data.length / 10));
+    data.forEach((d, i) => {
+        const x = padL + i * (barW + barGap);
+        const h = (d.count / max) * plotH;
+        const y = padT + plotH - h;
+        svg += `<g data-idx="${i}">`;
+        svg += barShape(x, y, barW, h, 'up');
+        svg += `</g>`;
+        if (i % labelStep === 0) {
+            svg += `<text class="chart-tick" x="${x + barW / 2}" y="${height - 4}" text-anchor="middle">${d.label}</text>`;
+        }
+    });
+    svg += `</svg>`;
+    el.innerHTML = svg;
+
+    el.querySelectorAll('g[data-idx]').forEach(g => {
+        const d = data[parseInt(g.dataset.idx)];
+        g.addEventListener('pointermove', evt => showTooltip(evt, d.label, d.count.toLocaleString('es-ES')));
+        g.addEventListener('pointerleave', hideTooltip);
+        g.addEventListener('click', () => {
+            const [y, m] = d.label.split('-');
+            const lastDay = new Date(parseInt(y), parseInt(m), 0).getDate();
+            document.getElementById('f_listened_from').value = `${d.label}-01`;
+            document.getElementById('f_listened_to').value = `${d.label}-${String(lastDay).padStart(2, '0')}`;
+            search(1);
+        });
+        g.style.cursor = 'pointer';
+    });
+}
+
+async function loadCharts() {
+    const params = currentFilters();
+    const dims = [
+        ['timeline', 'chart-timeline', null],
+        ['artist', 'chart-artist', 'artist'],
+        ['genre', 'chart-genre', 'genre'],
+        ['label', 'chart-label', 'label'],
+    ];
+    const results = await Promise.all(dims.map(([dim]) => {
+        const p = new URLSearchParams(params);
+        p.set('dimension', dim);
+        return fetch('/api/stats/breakdown?' + p.toString()).then(r => r.json());
+    }));
+    results.forEach((res, i) => {
+        const [dim, containerId, filterId] = dims[i];
+        if (dim === 'timeline') renderTimeline(containerId, res.data);
+        else renderTopBars(containerId, dim, res.data, filterId);
+    });
 }
 
 function renderPagination() {
