@@ -4,3 +4,4 @@ explorer.db
 .env
 *.env.bak*
 .env.bak*
+datos/
