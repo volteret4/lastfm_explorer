@@ -17,6 +17,7 @@ Uso:
 """
 import argparse
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,7 @@ MB_RATE_LIMIT = 1.1
 MB_MAX_RETRIES = 5
 RETRY_NONE_DAYS = 30
 
-musicbrainzngs.set_useragent("lastfm_explorer", "0.1", "contacto@example.org")
+musicbrainzngs.set_useragent("lastfm_explorer", "0.1", os.getenv("MB_CONTACT", "https://github.com/volteret4/lastfm_explorer"))
 
 _mb_last_call = 0.0
 
